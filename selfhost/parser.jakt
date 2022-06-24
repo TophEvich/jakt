@@ -3,9 +3,12 @@
 //
 // SPDX-License-Identifier: BSD-2-Clause
 
-import error { JaktError }
+
+import error { JaktError, print_error}
 import lexer { Token, NumericConstant }
 import utility { panic, todo, Span }
+import compiler { Compiler }
+import prelude { JaktPrelude }
 
 function merge_spans(anon start: Span, anon end: Span) -> Span => Span(start: start.start, end: end.end)
 function empty_span() -> Span => Span(start: 0, end: 0)
@@ -420,7 +423,7 @@ struct ParsedCall {
 boxed enum ParsedType {
     Name(name: String, span: Span)
     NamespacedName(name: String, namespaces: [String], params: [ParsedType], span: Span)
-    GenericType(name: String, generic_parameters: [(String, Span)], span: Span), // FIXME: tuple should be dictionary
+    GenericType(name: String, generic_parameters: [ParsedType], span: Span), // FIXME: tuple should be dictionary
     JaktArray(inner: ParsedType, span: Span)
     Dictionary(key: ParsedType, value: ParsedType, span: Span)
     JaktTuple(types: [ParsedType], span: Span)
@@ -434,23 +437,22 @@ boxed enum ParsedType {
 struct Parser {
     index: usize
     tokens: [Token]
-    errors: [JaktError]
-    ignore_errors: bool
+    compiler: Compiler
 
-    function parse(tokens: [Token], errors: [JaktError]) throws -> ParsedNamespace {
-        mut parser = Parser(index: 0, tokens, errors, ignore_errors: false)
+    function parse(compiler: Compiler, tokens: [Token]) throws -> ParsedNamespace {
+        mut parser = Parser(index: 0, tokens, compiler)
         return parser.parse_namespace()
     }
 
     function error(mut this, anon message: String, anon span: Span) throws {
-        if not .ignore_errors {
-            .errors.push(JaktError::Message(message, span))
+        if not .compiler.ignore_parser_errors {
+            .compiler.errors.push(JaktError::Message(message, span))
         }
     }
 
     function error_with_hint(mut this, anon message: String, anon span: Span, anon hint: String, anon hint_span: Span) throws {
-        if not .ignore_errors {
-            .errors.push(JaktError::MessageWithHint(message, span, hint, hint_span))
+        if not .compiler.ignore_parser_errors {
+            .compiler.errors.push(JaktError::MessageWithHint(message, span, hint, hint_span))
         }
     }
 
@@ -490,6 +492,8 @@ struct Parser {
         )
 
         while not .eof() {
+
+            .compiler.dbg_println(format("parse_namespace: {}", .current()))
             match .current() {
                 Import => {
                     parsed_namespace.imports.push(.parse_import())
@@ -569,24 +573,27 @@ struct Parser {
         return parsed_namespace
     }
 
-    function parse_record(mut this, anon definition_linkage: DefinitionLinkage) throws -> ParsedRecord => match .current() {
-        Struct => .parse_struct(definition_linkage)
-        Class => .parse_class(definition_linkage)
-        Enum => .parse_enum(definition_linkage, is_boxed: false)
-        Boxed => {
-            .index++
-            yield .parse_enum(definition_linkage, is_boxed: true)
-        }
-        else => {
-            .error("Expected `struct`, `class`, `enum`, or `boxed`", .current().span())
-            yield ParsedRecord(
-                name: "",
-                name_span: empty_span(),
-                generic_parameters: [],
-                definition_linkage,
-                methods: [],
-                record_type: RecordType::Garbage
-            )
+    function parse_record(mut this, anon definition_linkage: DefinitionLinkage) throws -> ParsedRecord {
+        .compiler.dbg_println(format("parse_record: {}", .current()))
+        return match .current() {
+            Struct => .parse_struct(definition_linkage)
+            Class => .parse_class(definition_linkage)
+            Enum => .parse_enum(definition_linkage, is_boxed: false)
+            Boxed => {
+                .index++
+                yield .parse_enum(definition_linkage, is_boxed: true)
+            }
+            else => {
+                .error("Expected `struct`, `class`, `enum`, or `boxed`", .current().span())
+                yield ParsedRecord(
+                    name: "",
+                    name_span: empty_span(),
+                    generic_parameters: [],
+                    definition_linkage,
+                    methods: [],
+                    record_type: RecordType::Garbage
+                )
+            }
         }
     }
 
@@ -958,11 +965,13 @@ struct Parser {
     }
 
     public function parse_struct_class_body(mut this, definition_linkage: DefinitionLinkage, default_visibility: Visibility, is_class: bool) throws -> ([ParsedField],[ParsedMethod]) {
+        .compiler.dbg_println(format("parse_generic_parameters {}", .current()))
         if .current() is LCurly {
             .index++
         } else {
             .error("Expected ‘{’", .current().span())
         }
+        .compiler.dbg_println(format("parse_generic_parameters #2 {}", .current()))
 
         mut fields: [ParsedField] = []
         mut methods: [ParsedMethod] = []
@@ -1057,6 +1066,7 @@ struct Parser {
     }
 
     public function parse_struct(mut this, anon definition_linkage: DefinitionLinkage) throws -> ParsedRecord {
+        .compiler.dbg_println(format("parse_struct {}", .current()))
         mut parsed_struct = ParsedRecord(
             name: "",
             name_span: empty_span(),
@@ -1176,6 +1186,7 @@ struct Parser {
     }
 
     public function parse_function(mut this, anon linkage: FunctionLinkage, anon visibility: Visibility) throws -> ParsedFunction {
+        .compiler.dbg_println(format("parse_function: {}", .current()))
         mut parsed_function = ParsedFunction(
             name: "",
             name_span: empty_span(),
@@ -1204,6 +1215,7 @@ struct Parser {
         }
         parsed_function.name = function_name
         parsed_function.name_span = .current().span()
+        .compiler.dbg_println(format("parse_function name: {}", parsed_function.name))
 
         .index++
 
@@ -1324,6 +1336,7 @@ struct Parser {
         if .current() is Arrow {
             .index++
             let start = .current().span()
+            .compiler.dbg_println(format("parse_function, found arrow current: {}, starting parsing return-type by parse_typename()", .current()))
             parsed_function.return_type = .parse_typename()
             parsed_function.return_type_span = merge_spans(start, .previous().span())
         }
@@ -1350,6 +1363,7 @@ struct Parser {
     }
 
     function parse_field(mut this, anon visibility: Visibility) throws -> ParsedField {
+        .compiler.dbg_println(format("parse_field {}", .current()))
         let parsed_variable_declaration = .parse_variable_declaration(is_mutable: true)
 
         if parsed_variable_declaration.parsed_type is Empty {
@@ -1377,8 +1391,9 @@ struct Parser {
 
     function parse_typename(mut this) throws -> ParsedType {
         let start = .current().span()
+        .compiler.dbg_println(format("parse_typename: {}", .current()))
         mut parsed_type = .parse_type_shorthand()
-
+        
         if parsed_type is Empty {
             parsed_type = .parse_type_longhand()
         }
@@ -1392,54 +1407,59 @@ struct Parser {
         return parsed_type
     }
 
-    function parse_type_longhand(mut this) throws -> ParsedType => match .current() {
-        Raw => {
-            let start = .current().span()
-            .index++
-            let inner = .parse_typename()
-            let span = merge_spans(start, .current().span())
-            // NOTE: We rewrite `raw T?` from `RawPtr<Optional<T>>` to `Optional<RawPtr<T>>`
-            yield match inner {
-                Optional(inner) => ParsedType::Optional(inner: ParsedType::RawPtr(inner, span), span)
-                else => ParsedType::RawPtr(inner, span)
-            }
-        }
-        Weak => {
-            let start = .current().span()
-            .index++
-            let inner = .parse_typename()
-            let span = merge_spans(start, .current().span())
-            // NOTE: We rewrite `weak T?` from `WeakPtr<Optional<T>>` to `WeakPtr<T>`
-            yield match inner {
-                Optional(inner) => ParsedType::WeakPtr(inner, span)
-                else => {
-                    .error("missing `?` after weak pointer type name", span)
-                    yield ParsedType::WeakPtr(inner, span)
+    function parse_type_longhand(mut this) throws -> ParsedType {
+        .compiler.dbg_println(format("parse_type_longhand: {}", .current()))
+        return match .current() {
+            Raw => {
+                let start = .current().span()
+                .index++
+                let inner = .parse_typename()
+                let span = merge_spans(start, .current().span())
+                // NOTE: We rewrite `raw T?` from `RawPtr<Optional<T>>` to `Optional<RawPtr<T>>`
+                yield match inner {
+                    Optional(inner) => ParsedType::Optional(inner: ParsedType::RawPtr(inner, span), span)
+                    else => ParsedType::RawPtr(inner, span)
                 }
             }
-        }
-        Identifier(name) => {
-            let span = .current().span()
-            .index++
-            mut parsed_type =  ParsedType::Name(name, span)
-            if .current() is LessThan {
-                mut parsed_generics = .parse_generic_parameters()
-                // FIXME: clean this up when ParsedType::GenericType can have [[String:Span]] generic parameters
-                mut generic_parameters: [(String, Span)] = []
-                for parsed_generic in parsed_generics.iterator() {
-                    generic_parameters.push((parsed_generic.name, parsed_generic.span))
+            Weak => {
+                let start = .current().span()
+                .index++
+                let inner = .parse_typename()
+                let span = merge_spans(start, .current().span())
+                // NOTE: We rewrite `weak T?` from `WeakPtr<Optional<T>>` to `WeakPtr<T>`
+                yield match inner {
+                    Optional(inner) => ParsedType::WeakPtr(inner, span)
+                    else => {
+                        .error("missing `?` after weak pointer type name", span)
+                        yield ParsedType::WeakPtr(inner, span)
+                    }
                 }
-                parsed_type = ParsedType::GenericType(name, generic_parameters, span)
             }
-            yield parsed_type
+            Identifier(name) => {
+                let span = .current().span()
+                .index++
+                mut parsed_type =  ParsedType::Name(name, span)
+                if .current() is LessThan {
+                    mut parsed_generics = .parse_generic_parameters()
+                    // FIXME: clean this up when ParsedType::GenericType can have [[String:Span]] generic parameters
+                    mut generic_parameters: [ParsedType] = []
+                    for parsed_generic in parsed_generics.iterator() {
+                        generic_parameters.push(ParsedType::Name(name: parsed_generic.name, span: parsed_generic.span))
+                    }
+                    parsed_type = ParsedType::GenericType(name, generic_parameters, span)
+                }
+                yield parsed_type
+            }
+            else => {
+                .error("Expected type name", .current().span())
+                .compiler.panic("Expected type name")
+                yield ParsedType::Empty
+            }
         }
-        else => {
-            .error("Expected type name", .current().span())
-            yield ParsedType::Empty
-        }
-    }
+    } 
 
     function parse_variable_declaration(mut this, is_mutable: bool) throws -> ParsedVarDecl {
+        .compiler.dbg_println(format("parse_field {}", .current()))
         match .current() {
             Identifier(name) => {
                 let var_name = name
@@ -1475,14 +1495,18 @@ struct Parser {
         )
     }
 
-    function parse_type_shorthand(mut this) throws -> ParsedType => match .current() {
-        LSquare => .parse_type_shorthand_array_or_dictionary()
-        LCurly => .parse_type_shorthand_set()
-        LParen => .parse_type_shorthand_tuple()
-        else => ParsedType::Empty
-    }
+    function parse_type_shorthand(mut this) throws -> ParsedType {
+        .compiler.dbg_println(format("parse_type_shorthand: {}", .current()))
+        return match .current() {
+            LSquare => .parse_type_shorthand_array_or_dictionary()
+            LCurly => .parse_type_shorthand_set()
+            LParen => .parse_type_shorthand_tuple()
+            else => ParsedType::Empty
+        }
+    } 
 
     function parse_type_shorthand_array_or_dictionary(mut this) throws -> ParsedType {
+        .compiler.dbg_println(format("parse_type_shorthand_array_or_dictionary: {}", .current()))
         // [T] is shorthand for Array<T>
         // [K:V] is shorthand for Dictionary<K, V>
         let start = .current().span()
@@ -1507,6 +1531,8 @@ struct Parser {
     }
 
     function parse_type_shorthand_set(mut this) throws -> ParsedType {
+
+        .compiler.dbg_println(format("parse_type_shorthand_set: {}", .current()))
         // {T} is shorthand for Set<T>
         let start = .current().span()
         if .current() is LCurly {
@@ -1523,6 +1549,7 @@ struct Parser {
 
     function parse_type_shorthand_tuple(mut this) throws -> ParsedType {
         // (A, B, C) is shorthand for Tuple<A, B, C>
+        .compiler.dbg_println(format("parse_type_shorthand_tuple: {}", .current()))
         let start = .current().span()
         .index++
         mut types: [ParsedType] = []
@@ -1803,7 +1830,7 @@ struct Parser {
 
                         expr_stack.push(ParsedExpression::BinaryOp(lhs, op, rhs, span: new_span))
                     }
-                    else => panic("operator is not an operator")
+                    else => .compiler.panic("operator is not an operator")
                 }
             }
 
@@ -1823,7 +1850,7 @@ struct Parser {
                     let new_span = merge_spans(lhs.span(), rhs.span())
                     expr_stack.push(ParsedExpression::BinaryOp(lhs, op, rhs, span: new_span))
                 }
-                else => panic("operator is not an operator")
+                else => .compiler.panic("operator is not an operator")
             }
         }
 
@@ -1888,9 +1915,9 @@ struct Parser {
             }
             if .peek(1) is LessThan {
                 // We *try* to see if it's a generic, but the parse errors, we back up and try something else
-                .ignore_errors = true
+                .compiler.ignore_parser_errors = true
                 let call = .parse_call()
-                .ignore_errors = false
+                .compiler.ignore_parser_errors = false
                 if not call.has_value() {
                     return match name {
                         "None" => ParsedExpression::OptionalNone(span)
@@ -1967,7 +1994,7 @@ struct Parser {
                 Minus => UnaryOperator::Negate
                 else => {
                     // FIXME: This is unreachable
-                    panic("unreachable")
+                    .compiler.panic("unreachable")
                     yield UnaryOperator::Negate
                 }
             }
@@ -2498,6 +2525,8 @@ struct Parser {
     }
 
     function parse_generic_parameters(mut this) throws -> [ParsedGenericParameter] {
+
+        .compiler.dbg_println(format("parse_generic_parameters {}", .current()))
         if not .current() is LessThan {
             return []
         }
