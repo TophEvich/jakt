@@ -4074,8 +4074,7 @@ struct Typechecker {
         }
     }
 
-    function typecheck_expression(mut this, anon expr: ParsedExpression, scope_id: ScopeId, safety_mode: SafetyMode) throws -> CheckedExpression => match expr {
-        IndexedStruct(expr, field, span) => .typecheck_indexed_struct(expr, field, scope_id, safety_mode, span)
+    function typecheck_expression(mut this, anon expr: ParsedExpression, scope_id: ScopeId, safety_mode: SafetyMode) throws -> CheckedExpression => match expr { IndexedStruct(expr, field, span) => .typecheck_indexed_struct(expr, field, scope_id, safety_mode, span)
         Boolean(val, span) => CheckedExpression::Boolean(val, span)
         NumericConstant(val, span) => {
             // FIXME: better constant support
@@ -4123,7 +4122,7 @@ struct Typechecker {
                         checked_call = call
                     }
                     else => {
-                        .compiler.panic(format("This should be unreachable, ParsedExpression::MethodCall on String should be CheckedExpression::Call and not: {}", .type_name(checked_call_expr_type_id)))
+                        .compiler.panic(format("typecheck_call should return `CheckedExpression::Call()`, not `{}`", .type_name(checked_call_expr_type_id)))
                     } 
                 }
                 yield_value = CheckedExpression::MethodCall(
@@ -4136,23 +4135,43 @@ struct Typechecker {
             } else {
 
                 let checked_expr_type = .get_type(checked_expr_type_id)
-                let parent_id = match checked_expr_type  {
-                    Struct(id) => StructOrEnumId::Struct(id)
-                    Enum(id) => StructOrEnumId::Enum(id)
+                mut parent_id: StructOrEnumId? = None
+                match checked_expr_type {
+                    Struct(id) => {
+                        parent_id = StructOrEnumId::Struct(id)
+                    }
+                    Enum(id) => {
+                        parent_id = StructOrEnumId::Enum(id)
+                    }
+                    GenericInstance(id) => {
+                        parent_id = StructOrEnumId::Struct(id)
+                    }
+                    GenericEnumInstance(id) => {
+                        parent_id = StructOrEnumId::Enum(id)
+                    }
                     else => {
-                        todo(format("Method call on {}", .type_name(checked_expr_type_id)))
-                        yield StructOrEnumId::Struct(StructId(module: ModuleId(id: 0), id: 0))
+                        //todo(format("Method call on {}", .type_name(checked_expr_type_id)))
+                        //yield StructOrEnumId::Struct(StructId(module: ModuleId(id: 0), id: 0))
                     }
                 }
-
-                let checked_call_expr = .typecheck_call(call, caller_scope_id: scope_id, span, this_expr: checked_expr, parent_id, safety_mode, must_be_enum_constructor: false)
-                let type_id = expression_type(checked_call_expr)
-                yield_value =  match checked_call_expr {
-                    Call(call) => CheckedExpression::MethodCall(expr: checked_expr, call, span, type_id)
-                    else => {
-                        .compiler.panic("typecheck_call should return `CheckedExpression::Call()`")
-                        yield CheckedExpression::Garbage(span)
+                if parent_id.has_value()  {
+                    let checked_call_expr = .typecheck_call(call, caller_scope_id: scope_id, span, this_expr: checked_expr, parent_id: parent_id!, safety_mode, must_be_enum_constructor: false)
+                    let type_id = expression_type(checked_call_expr)
+                    yield_value = match checked_call_expr {
+                        Call(call) => CheckedExpression::MethodCall(expr: checked_expr, call, span, type_id)
+                        else => {
+                            .compiler.panic(format("typecheck_call should return `CheckedExpression::Call()`, not `{}`", .type_name(type_id)))
+                            yield CheckedExpression::Garbage(span)
+                        }
                     }
+                } else {
+                    yield_value = .typecheck_generic_arguments_method_call(
+                        checked_expr
+                        call
+                        scope_id
+                        span
+                        safety_mode
+                    )
                 }
             }
             yield yield_value!
@@ -4483,6 +4502,37 @@ struct Typechecker {
 
             yield CheckedExpression::Boolean(val: false, span: Span(start: 0, end: 0))
         }
+    }
+
+    function typecheck_generic_arguments_method_call(mut this, checked_expr: CheckedExpression, call: ParsedCall, scope_id: ScopeId, span: Span, safety_mode: SafetyMode) throws -> CheckedExpression {
+        mut checked_args: [(String, CheckedExpression)] = []
+        checked_args.ensure_capacity(call.args.size())
+        for call_arg in call.args.iterator() {
+            let name: String = call_arg.0
+            let expr: ParsedExpression = call_arg.2
+            let checked_arg_expr = .typecheck_expression(
+                expr
+                scope_id
+                safety_mode
+            )
+            let checked_arg: (String, CheckedExpression) = (name, checked_arg_expr)
+            checked_args.push(checked_arg)
+        }
+
+        let none_function_id: FunctionId? = None // FIXME: use None directly
+        return CheckedExpression::MethodCall(
+            expr: checked_expr
+            call: CheckedCall(
+                namespace_: []
+                name: call.name
+                args: checked_args
+                function_id: none_function_id
+                return_type: unknown_type_id()
+                callee_throws: false
+            )
+            span
+            type_id: unknown_type_id()
+        )
     }
 
     function typecheck_match(mut this, expr: ParsedExpression, cases: [ParsedMatchCase], span: Span, scope_id: ScopeId, safety_mode: SafetyMode) throws -> CheckedExpression {
