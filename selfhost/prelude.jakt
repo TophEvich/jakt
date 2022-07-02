@@ -5,6 +5,7 @@ struct JaktPrelude {
         let string = JaktPrelude::to_string()
         mut pos: usize = 0
         mut bytes_: [u8] = []
+        bytes_.ensure_capacity(string.length())
         while pos < string.length() {
             bytes_.push(string.byte_at(pos)) 
             ++pos
